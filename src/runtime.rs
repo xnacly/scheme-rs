@@ -8,19 +8,20 @@ use crate::{
     ast::{DefinitionBody, Primitive},
     cps::{Compile, Cps, codegen::RuntimeFunctionsBuilder},
     env::{Environment, Global, TopLevelEnvironment},
-    exceptions::{Exception, raise},
+    exceptions::{Exception, SourceStore, raise},
     gc::{Gc, GcInner, Trace, init_gc},
     hashtables::EqualHashSet,
     lists::{Pair, list_to_vec},
     num,
-    ports::{BufferMode, Port, Transcoder},
     proc::{Application, ContBarrier, ContinuationPtr, FuncPtr, ProcDebugInfo, Procedure, UserPtr},
     registry::Registry,
     symbols::Symbol,
     syntax::{Identifier, Span, Syntax},
     value::{Cell, UnpackedValue, Value},
 };
-use parking_lot::RwLock;
+use parking_lot::{
+    MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
+};
 use scheme_rs_macros::{maybe_async, maybe_await, runtime_fn};
 use std::{
     collections::{BTreeSet, HashSet},
@@ -81,15 +82,29 @@ impl Runtime {
     /// Run a program at the given location and return the values.
     #[maybe_async]
     pub fn run_program(&self, path: &Path) -> Result<Vec<Value>, Exception> {
-        #[cfg(not(feature = "async"))]
-        use std::fs::File;
-
-        #[cfg(feature = "tokio")]
-        use tokio::fs::File;
-
         let progm = TopLevelEnvironment::new_program(self, path);
         let env = Environment::Top(progm.clone());
+
+        #[cfg(feature = "store-source")]
         let mut form = {
+            let contents = maybe_await!(read_to_string(path))?;
+            let lines = contents.lines().map(|x| x.to_string()).collect();
+            let file_name = path.file_name().unwrap().to_str().unwrap_or("<unknown>");
+            let form = Syntax::from_str(&contents, Some(file_name))?;
+            self.write_sources().store(form.span().file.clone(), lines);
+            form
+        };
+
+        #[cfg(not(feature = "store-source"))]
+        let mut form = {
+            use crate::ports::{BufferMode, Port, Transcoder};
+
+            #[cfg(not(feature = "async"))]
+            use std::fs::File;
+
+            #[cfg(feature = "tokio")]
+            use tokio::fs::File;
+
             let port = Port::new(
                 path.display(),
                 maybe_await!(File::open(path)).map_err(Exception::io_error)?,
@@ -166,6 +181,26 @@ impl Runtime {
     pub(crate) unsafe fn from_raw_inc_rc(rt: *mut GcInner<RwLock<RuntimeInner>>) -> Self {
         unsafe { Self(Gc::from_raw_inc_rc(rt)) }
     }
+
+    pub fn read_sources(&self) -> MappedRwLockReadGuard<'_, SourceStore> {
+        RwLockReadGuard::map(self.0.read(), |inner| &inner.source_store)
+    }
+
+    pub fn write_sources(&self) -> MappedRwLockWriteGuard<'_, SourceStore> {
+        RwLockWriteGuard::map(self.0.write(), |inner| &mut inner.source_store)
+    }
+}
+
+#[allow(unused)]
+#[cfg(not(feature = "async"))]
+fn read_to_string(path: &Path) -> std::io::Result<String> {
+    std::fs::read_to_string(path)
+}
+
+#[allow(unused)]
+#[cfg(feature = "tokio")]
+async fn read_to_string(path: &Path) -> std::io::Result<String> {
+    tokio::fs::read_to_string(path).await
 }
 
 #[cfg(not(feature = "async"))]
@@ -187,6 +222,7 @@ pub(crate) struct RuntimeInner {
     pub(crate) constants_pool: EqualHashSet,
     pub(crate) globals_pool: HashSet<Global>,
     pub(crate) debug_info: DebugInfo,
+    pub(crate) source_store: SourceStore,
 }
 
 impl Default for RuntimeInner {
@@ -222,6 +258,7 @@ impl RuntimeInner {
             constants_pool: EqualHashSet::new(),
             globals_pool: HashSet::new(),
             debug_info: DebugInfo::default(),
+            source_store: SourceStore::default(),
         }
     }
 }

@@ -1,4 +1,5 @@
 use clap::Parser;
+use parking_lot::Mutex;
 use rustyline::{
     Completer, Config, Editor, Helper, Highlighter, Hinter, Validator,
     highlight::MatchingBracketHighlighter,
@@ -7,16 +8,13 @@ use rustyline::{
 };
 use scheme_rs::{
     env::TopLevelEnvironment,
-    exceptions::{Assertion, Exception, Message, PrettyException, StackTrace, SyntaxViolation},
-    gc::Gc,
-    ports::{BufferMode, Port, Prompt, Transcoder},
+    exceptions::Exception,
+    ports::{BufferMode, IntoPort, Port, Prompt, ReadFn, Transcoder},
     runtime::Runtime,
     syntax::{Span, Syntax},
 };
 use scheme_rs_macros::{maybe_async, maybe_await};
-use std::io::Write;
-use std::{fs, process};
-use std::{io, path::Path};
+use std::{path::Path, process, sync::Arc};
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -26,6 +24,9 @@ struct Args {
     #[arg(short, long)]
     interactive: bool,
 }
+
+#[cfg(not(feature = "async"))]
+use rustyline::history::FileHistory;
 
 #[derive(Default)]
 struct InputValidator;
@@ -49,12 +50,50 @@ struct InputHelper {
     highlighter: MatchingBracketHighlighter,
 }
 
+pub struct TextStoringPrompt {
+    #[cfg(not(feature = "async"))]
+    prompt: Prompt<InputHelper, FileHistory>,
+    #[cfg(feature = "async")]
+    prompt: Prompt,
+    text: Arc<Mutex<String>>,
+}
+
+#[cfg(not(feature = "async"))]
+impl IntoPort for TextStoringPrompt {
+    fn read_fn() -> Option<ReadFn> {
+        let prompt_read_fn = Prompt::<InputHelper, FileHistory>::read_fn().unwrap();
+        Some(Box::new(move |any, buff, start, count| {
+            let this = any.downcast_mut::<Self>().unwrap();
+            let written = (prompt_read_fn)(&mut this.prompt, buff, start, count)?;
+            this.text
+                .lock()
+                .push_str(str::from_utf8(&buff.as_slice()[start..(start + written)]).unwrap());
+            Ok(written)
+        }))
+    }
+}
+
+#[cfg(feature = "async")]
+impl IntoPort for TextStoringPrompt {
+    fn read_fn() -> Option<ReadFn> {
+        Some(Box::new(move |any, buff, start, count| {
+            Box::pin(async move {
+                let prompt_read_fn = Prompt::read_fn().unwrap();
+                let this = any.downcast_mut::<Self>().unwrap();
+                let written = (prompt_read_fn)(&mut this.prompt, buff, start, count).await?;
+                this.text
+                    .lock()
+                    .push_str(str::from_utf8(&buff.as_slice()[start..(start + written)]).unwrap());
+                Ok(written)
+            })
+        }))
+    }
+}
+
 /// scheme-rs entry point
 #[maybe_async]
-fn entry() -> Result<(), Exception> {
+fn entry(runtime: &Runtime) -> Result<(), Exception> {
     let args = Args::parse();
-
-    let runtime = Runtime::new();
 
     // Run any programs
     for file in &args.files {
@@ -66,7 +105,7 @@ fn entry() -> Result<(), Exception> {
         return Ok(());
     }
 
-    let repl = TopLevelEnvironment::new_repl(&runtime);
+    let repl = TopLevelEnvironment::new_repl(runtime);
 
     maybe_await!(repl.import("(library (rnrs))".parse().unwrap()))
         .expect("Failed to import standard library");
@@ -91,7 +130,12 @@ fn entry() -> Result<(), Exception> {
 
     editor.set_helper(Some(helper));
 
-    let prompt = Prompt::new(editor);
+    let text = Arc::new(Mutex::new(String::new()));
+
+    let prompt = TextStoringPrompt {
+        prompt: Prompt::new(editor),
+        text: text.clone(),
+    };
 
     let mut span = Span::new("<prompt>");
     let input_port = Port::new(
@@ -123,7 +167,16 @@ fn entry() -> Result<(), Exception> {
                     n_results += 1;
                 }
             }
-            Err(err) => print_exception(err).unwrap(),
+            Err(exception) => {
+                let mut source_store = runtime.write_sources();
+                source_store.store(
+                    span.file.clone(),
+                    text.lock().lines().map(|x| x.to_string()).collect(),
+                );
+                let mut out = String::new();
+                exception.pretty_print(&source_store, &mut out).unwrap();
+                print!("{out}");
+            }
         }
     }
 
@@ -133,54 +186,14 @@ fn entry() -> Result<(), Exception> {
 #[maybe_async]
 #[cfg_attr(feature = "async", tokio::main)]
 fn main() {
-    if let Err(e) = maybe_await!(entry()) {
-        print_exception(e).unwrap();
+    let runtime = Runtime::new();
+
+    if let Err(exception) = maybe_await!(entry(&runtime)) {
+        let mut out = String::new();
+        exception
+            .pretty_print(&runtime.read_sources(), &mut out)
+            .unwrap();
+        print!("{out}");
         process::exit(1);
     };
-}
-
-fn pretty_print_exception<W: std::io::Write>(
-    w: &mut W,
-    filename: &str,
-    pe: &impl PrettyException<W>,
-) -> io::Result<()> {
-    // only doing this once would be a bit better for perf, but this is the "err" path either way.
-    let contents = fs::read_to_string(filename).unwrap_or_default();
-    let lines: Vec<&str> = contents.lines().collect();
-    // writeln!(w)?;
-    pe.pretty_print(w, filename, &lines)
-}
-
-fn print_exception(exception: Exception) -> io::Result<()> {
-    let stdout = io::stdout();
-    let mut w = stdout.lock();
-
-    let Ok(conditions) = exception.simple_conditions() else {
-        return writeln!(
-            w,
-            "Exception occurred with a non-condition value: {:?}",
-            exception.0
-        );
-    };
-
-    writeln!(w, "Uncaught exception:")?;
-    for condition in conditions.into_iter().rev() {
-        if let Some(message) = condition.cast_to_rust_type::<Message>() {
-            writeln!(w, " - Message: {}", message.message)?;
-        } else if let Some(syntax) = condition.cast_to_rust_type::<SyntaxViolation>() {
-            pretty_print_exception(&mut w, &syntax.file_name(), syntax.as_ref())?;
-        } else if let Some(trace) = condition.cast_to_rust_type::<StackTrace>() {
-            let Some(first) = trace.trace.first() else {
-                continue;
-            };
-            writeln!(w, " - Trace:")?;
-            let syntax = first.cast_to_scheme_type::<Gc<Syntax>>().unwrap();
-            pretty_print_exception(&mut w, syntax.span().file.as_str(), trace.as_ref())?;
-        } else if condition.cast_to_rust_type::<Assertion>().is_some() {
-            writeln!(w, " - Assertion failed")?;
-        } else {
-            writeln!(w, " - Condition: {condition:?}")?;
-        }
-    }
-    Ok(())
 }

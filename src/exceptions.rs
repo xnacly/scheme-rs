@@ -62,9 +62,10 @@ use crate::{
     value::{UnpackedValue, Value},
     vectors::Vector,
 };
+use by_address::ByAddress;
 use parking_lot::RwLock;
 use scheme_rs_macros::runtime_fn;
-use std::{convert::Infallible, fmt, io, ops::Range, sync::Arc};
+use std::{collections::HashMap, convert::Infallible, fmt, ops::Range, sync::Arc};
 
 /// A macro for easily creating new condition types.
 pub use scheme_rs_macros::define_condition_type;
@@ -266,6 +267,36 @@ impl Exception {
         }
         Ok(None)
     }
+
+    pub fn pretty_print(&self, source_store: &SourceStore, f: &mut impl fmt::Write) -> fmt::Result {
+        let Ok(conditions) = self.simple_conditions() else {
+            return writeln!(
+                f,
+                "Exception occurred with a non-condition value: {:?}",
+                self.0
+            );
+        };
+
+        writeln!(f, "Uncaught exception:")?;
+        for condition in conditions.into_iter().rev() {
+            if let Some(message) = condition.cast_to_rust_type::<Message>() {
+                writeln!(f, " - Message: {}", message.message)?;
+            } else if let Some(syntax) = condition.cast_to_rust_type::<SyntaxViolation>() {
+                println!(" - Syntax error:");
+                source_store.pretty_print_condition(syntax.as_ref(), f)?;
+            } else if let Some(trace) = condition.cast_to_rust_type::<StackTrace>() {
+                if !trace.trace.is_empty() {
+                    writeln!(f, " - Trace:")?;
+                    source_store.pretty_print_condition(trace.as_ref(), f)?;
+                }
+            } else if condition.cast_to_rust_type::<Assertion>().is_some() {
+                writeln!(f, " - Assertion failed")?;
+            } else {
+                writeln!(f, " - Condition: {condition:?}")?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl From<&'_ Value> for Option<Exception> {
@@ -334,26 +365,25 @@ macro_rules! impl_into_condition_for {
     };
 }
 
-pub trait PrettyException<W>
-where
-    W: std::io::Write,
-{
-    fn pretty_print<S: std::fmt::Display>(
-        &self,
-        w: &mut W,
-        filename: &str,
-        lines: &[S],
-    ) -> io::Result<()>;
+pub trait PrettyCondition {
+    fn span(&self) -> Span;
+
+    fn pretty_print(&self, _w: &mut impl fmt::Write) -> fmt::Result {
+        Ok(())
+    }
 }
 
-fn print_lines_with_offense_from_span<W, S>(w: &mut W, span: &Span, lines: &[S]) -> io::Result<()>
-where
-    W: std::io::Write,
-    S: std::fmt::Display,
-{
-    if lines.is_empty() {
+/// Pretty print a condition with source information, heavily inspired by
+/// [T8Err::render](https://github.com/xnacly/tango8/blob/master/shared/src/err.rs#L11)
+fn print_lines_with_offense_from_span(
+    span: &Span,
+    lines: Option<&[String]>,
+    w: &mut impl fmt::Write,
+) -> fmt::Result {
+    let Some(lines) = lines else {
         return Ok(());
-    }
+    };
+
     writeln!(w, "--> {}:{}:{}:", span.file, span.line, span.column)?;
     let start = span.line.saturating_sub(2);
     let end = (span.line + 3).min(lines.len() as u32);
@@ -494,36 +524,20 @@ define_condition_type!(
     }
 );
 
-impl<W> PrettyException<W> for StackTrace
-where
-    W: std::io::Write,
-{
-    fn pretty_print<S: std::fmt::Display>(
-        &self,
-        w: &mut W,
-        filename: &str,
-        lines: &[S],
-    ) -> io::Result<()> {
+impl PrettyCondition for StackTrace {
+    fn span(&self) -> Span {
         let first = self.trace.first().unwrap();
         let syntax = first.cast_to_scheme_type::<Gc<Syntax>>().unwrap();
-        let mut span = syntax.span().clone();
-        span.file = Arc::new(
-            if filename.is_empty() {
-                "repl"
-            } else {
-                filename
-            }
-            .to_string(),
-        );
+        syntax.span().clone()
+    }
 
+    fn pretty_print(&self, w: &mut impl fmt::Write) -> fmt::Result {
         for (i, trace) in self.trace.iter().enumerate() {
             let syntax = trace.cast_to_scheme_type::<Gc<Syntax>>().unwrap();
             let span = syntax.span();
             let func_name = syntax.as_ident().unwrap().symbol();
             writeln!(w, "{:>6}: {func_name}:{span}", i + 1)?;
         }
-
-        print_lines_with_offense_from_span(w, &span, lines)?;
         Ok(())
     }
 }
@@ -750,40 +764,15 @@ define_condition_type!(
     },
 );
 
-impl<W> PrettyException<W> for SyntaxViolation
-where
-    W: std::io::Write,
-{
-    /// pretty print a SyntaxViolation, heavily inspired by
-    /// [T8Err::render](https://github.com/xnacly/tango8/blob/master/shared/src/err.rs#L11)
-    fn pretty_print<S: std::fmt::Display>(
-        &self,
-        w: &mut W,
-        filename: &str,
-        lines: &[S],
-    ) -> io::Result<()> {
-        // This is set if the syntax violation is a call to an undefined function, but since the
-        // message itself is not part of this pretty printing, but rather its own condition, we
-        // cant do anything with it.
-        //
-        // if let Some(sf) = &self.subform {
-        //     dbg!(sf);
-        // }
-
-        let unpacked_value_ref = self.form.unpacked_ref();
-        let UnpackedValue::Syntax(gc_inner) = unpacked_value_ref.as_ref() else {
-            unreachable!();
-        };
-        let mut span = gc_inner.span().clone();
-        span.file = Arc::new(
-            if filename.is_empty() {
-                "repl"
-            } else {
-                filename
-            }
-            .to_string(),
-        );
-        print_lines_with_offense_from_span(w, &span, lines)
+impl PrettyCondition for SyntaxViolation {
+    fn span(&self) -> Span {
+        self.subform
+            .as_ref()
+            .unwrap_or(&self.form)
+            .cast_to_scheme_type::<Gc<Syntax>>()
+            .unwrap()
+            .span()
+            .clone()
     }
 }
 
@@ -794,14 +783,6 @@ impl SyntaxViolation {
             form: Value::from(form),
             subform: subform.map(Value::from),
         }
-    }
-
-    pub fn file_name(&self) -> String {
-        let unpacked_value_ref = self.form.unpacked_ref();
-        let UnpackedValue::Syntax(gc_inner) = unpacked_value_ref.as_ref() else {
-            unreachable!();
-        };
-        gc_inner.span().file.clone().to_string()
     }
 
     pub fn new_from_values(form: Value, subform: Option<Value>) -> Self {
@@ -1128,4 +1109,33 @@ pub fn assertion_violation(
     Err(Exception(Value::from(Exception::from(CompoundCondition(
         conditions,
     )))))
+}
+
+/// Store of source files for pretty printing error messages.
+#[derive(Default, Trace)]
+pub struct SourceStore {
+    store: HashMap<ByAddress<Arc<str>>, Vec<String>>,
+}
+
+impl SourceStore {
+    pub fn store(&mut self, file_name: Arc<str>, lines: Vec<String>) {
+        self.store.insert(ByAddress(file_name), lines);
+    }
+
+    pub fn fetch(&self, file_name: &Arc<str>) -> Option<&[String]> {
+        self.store
+            .get(ByAddress::from_ref(file_name))
+            .map(|x| x.as_ref())
+    }
+
+    pub fn pretty_print_condition(
+        &self,
+        pe: &impl PrettyCondition,
+        w: &mut impl fmt::Write,
+    ) -> fmt::Result {
+        let span = pe.span();
+        let lines = self.fetch(&span.file);
+        pe.pretty_print(w)?;
+        print_lines_with_offense_from_span(&span, lines, w)
+    }
 }
